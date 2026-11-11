@@ -3,6 +3,7 @@ package com.ocybin.phraselooper
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -155,14 +156,19 @@ fun LooperDashboard(
     var isBusy by remember { mutableStateOf(false) } // true while saving or loading a file
     var playheadIndex by remember { mutableIntStateOf(0) }
     var showMetronomeSettings by remember { mutableStateOf(false) }
+    // The segment the person tapped 🗑 on, waiting for them to confirm
+    var segmentToDiscard by remember { mutableStateOf<Segment?>(null) }
+    // How long the current recording has been running
+    var recordingMillis by remember { mutableStateOf(0L) }
 
     val segs = engine.segments
     val selected = engine.selectedIndex
     val selectedSegment = segs.getOrNull(selected)
     val total = engine.totalSamples
 
-    // Which trim marker the arrow buttons move: 0 = start, 1 = end. Starts on "start" for each new selection.
-    var activeMarker by remember(selected) { mutableIntStateOf(0) }
+    // Which trim marker is switched on: -1 = none (the slider and arrow buttons stay locked), 0 = start, 1 = end.
+    // Every newly selected segment starts locked, so scrolling the screen can't nudge a marker by accident.
+    var activeMarker by remember(selected) { mutableIntStateOf(-1) }
 
     // The trim slider is rebuilt from the segment whenever the selection or the clip list changes
     var sliderRange by remember(selected, engine.bufferVersion) {
@@ -181,6 +187,17 @@ fun LooperDashboard(
     }
 
     // If a recording ends by itself (memory limit), update the message
+    LaunchedEffect(engine.isRecording) {
+        if (engine.isRecording) {
+            val startedAt = SystemClock.elapsedRealtime()
+            recordingMillis = 0L
+            while (engine.isRecording) {
+                recordingMillis = SystemClock.elapsedRealtime() - startedAt
+                delay(100)
+            }
+        }
+    }
+
     LaunchedEffect(engine.isRecording) {
         if (!engine.isRecording) {
             metronome.stop()
@@ -298,7 +315,12 @@ fun LooperDashboard(
         Spacer(modifier = Modifier.height(16.dp))
 
         Text(
-            text = statusText,
+            text = if (engine.isRecording) {
+                val totalSeconds = (recordingMillis / 1000).toInt()
+                "Recording...  %d:%02d".format(java.util.Locale.US, totalSeconds / 60, totalSeconds % 60)
+            } else {
+                statusText
+            },
             style = MaterialTheme.typography.headlineSmall,
             modifier = Modifier.padding(bottom = 12.dp)
         )
@@ -355,6 +377,31 @@ fun LooperDashboard(
             modifier = Modifier.padding(top = 4.dp)
         )
 
+        segmentToDiscard?.let { seg ->
+            AlertDialog(
+                onDismissRequest = { segmentToDiscard = null },
+                title = { Text("Discard segment ${seg.label}?") },
+                text = { Text("This removes it (${seconds(seg.length)} s) from the loop. It can't be undone.") },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            val index = engine.segments.indexOf(seg)
+                            segmentToDiscard = null
+                            if (index >= 0) {
+                                engine.discardSegment(index)
+                                statusText = "Segment ${seg.label} discarded."
+                            }
+                        }
+                    ) {
+                        Text("DISCARD")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { segmentToDiscard = null }) { Text("CANCEL") }
+                }
+            )
+        }
+
         if (showMetronomeSettings) {
             MetronomeSettingsDialog(
                 metronome = metronome,
@@ -363,6 +410,34 @@ fun LooperDashboard(
                     showMetronomeSettings = false
                 }
             )
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // LOAD and SAVE
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Button(
+                onClick = { filePickerLauncher.launch("audio/*") },
+                enabled = controlsEnabled,
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary),
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
+                modifier = Modifier.weight(1f).height(55.dp)
+            ) {
+                Text(text = "📂 LOAD", textAlign = TextAlign.Center)
+            }
+
+            Button(
+                onClick = { exportLauncher.launch(defaultExportName(metronome)) },
+                enabled = engine.hasAudio && controlsEnabled,
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary),
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
+                modifier = Modifier.weight(1f).height(55.dp)
+            ) {
+                Text(text = "💾 SAVE", textAlign = TextAlign.Center)
+            }
         }
 
         Spacer(modifier = Modifier.height(16.dp))
@@ -432,56 +507,6 @@ fun LooperDashboard(
             }
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // SAVE, LOAD and CREATE SEGMENT
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Button(
-                onClick = { exportLauncher.launch(defaultExportName(metronome)) },
-                enabled = engine.hasAudio && controlsEnabled,
-                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary),
-                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp),
-                modifier = Modifier.weight(1f).height(55.dp)
-            ) {
-                Text(text = "💾 SAVE", textAlign = TextAlign.Center)
-            }
-
-            Button(
-                onClick = { filePickerLauncher.launch("audio/*") },
-                enabled = controlsEnabled,
-                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary),
-                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp),
-                modifier = Modifier.weight(1f).height(55.dp)
-            ) {
-                Text(text = "📂 LOAD", textAlign = TextAlign.Center)
-            }
-
-            // Copies what is looping (the selected segment's trimmed part, or the whole loop) into a new segment
-            Button(
-                onClick = {
-                    if (engine.createSegmentFromLoop()) {
-                        val made = engine.segments.last()
-                        statusText = "Created segment ${made.label} (${seconds(made.length)} s)."
-                    } else {
-                        val reason = engine.lastCreateError ?: "Couldn't create a segment."
-                        statusText = reason
-                        Toast.makeText(context, reason, Toast.LENGTH_LONG).show()
-                    }
-                },
-                enabled = engine.hasAudio && controlsEnabled,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.primaryContainer,
-                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer
-                ),
-                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp),
-                modifier = Modifier.weight(1.3f).height(55.dp)
-            ) {
-                Text(text = "➕ CREATE SEGMENT", textAlign = TextAlign.Center)
-            }
-        }
 
         Spacer(modifier = Modifier.height(32.dp))
 
@@ -498,21 +523,25 @@ fun LooperDashboard(
                 val clipSize = selectedSegment.audio.size
 
                 // Moves the chosen marker by a number of samples (the arrow buttons beside the title)
+                val markerOn = controlsEnabled && activeMarker >= 0
+
                 val nudge: (Int) -> Unit = { delta ->
-                    var s = selectedSegment.start
-                    var e = selectedSegment.end
-                    if (activeMarker == 0) s = (s + delta).coerceIn(0, e - 1)
-                    else e = (e + delta).coerceIn(s + 1, clipSize)
-                    sliderRange = (s.toFloat() / clipSize)..(e.toFloat() / clipSize)
-                    engine.trimSegmentSamples(selected, s, e)
+                    if (activeMarker >= 0) {
+                        var s = selectedSegment.start
+                        var e = selectedSegment.end
+                        if (activeMarker == 0) s = (s + delta).coerceIn(0, e - 1)
+                        else e = (e + delta).coerceIn(s + 1, clipSize)
+                        sliderRange = (s.toFloat() / clipSize)..(e.toFloat() / clipSize)
+                        engine.trimSegmentSamples(selected, s, e)
+                    }
                 }
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    NudgeButton("◀◀", controlsEnabled) { nudge(-DECISECOND) }
-                    NudgeButton("◀", controlsEnabled) { nudge(-CENTISECOND) }
+                    NudgeButton("◀◀", markerOn) { nudge(-DECISECOND) }
+                    NudgeButton("◀", markerOn) { nudge(-CENTISECOND) }
                     Column(
                         modifier = Modifier.weight(1f),
                         horizontalAlignment = Alignment.CenterHorizontally
@@ -520,8 +549,8 @@ fun LooperDashboard(
                         Text(text = "Trim tool", style = MaterialTheme.typography.bodyLarge)
                         Text(text = "segment ${selectedSegment.label}", style = MaterialTheme.typography.bodyLarge)
                     }
-                    NudgeButton("▶", controlsEnabled) { nudge(CENTISECOND) }
-                    NudgeButton("▶▶", controlsEnabled) { nudge(DECISECOND) }
+                    NudgeButton("▶", markerOn) { nudge(CENTISECOND) }
+                    NudgeButton("▶▶", markerOn) { nudge(DECISECOND) }
                 }
 
                 val liveLength = ((sliderRange.endInclusive - sliderRange.start) * clipSize).toInt()
@@ -538,17 +567,19 @@ fun LooperDashboard(
                     RangeSlider(
                         value = sliderRange,
                         onValueChange = { range ->
-                            // Whichever marker you move becomes the one the arrow buttons control
-                            if (range.start != sliderRange.start) activeMarker = 0
-                            else if (range.endInclusive != sliderRange.endInclusive) activeMarker = 1
-                            sliderRange = range
+                            // Only the marker that is switched on can move; the other one stays put
+                            sliderRange = when (activeMarker) {
+                                0 -> range.start..sliderRange.endInclusive
+                                1 -> sliderRange.start..range.endInclusive
+                                else -> sliderRange
+                            }
                         },
                         // The trim is applied when you let go, so the loop stays clean while you drag
                         onValueChangeFinished = {
                             engine.trimSegment(selected, sliderRange.start, sliderRange.endInclusive)
                         },
                         valueRange = 0f..1f,
-                        enabled = controlsEnabled,
+                        enabled = markerOn,
                         modifier = Modifier.fillMaxWidth()
                     )
 
@@ -573,15 +604,54 @@ fun LooperDashboard(
                     }
                 }
 
-                // Shows both marker times and which one the arrow buttons will move
-                OptionRow(
-                    options = listOf(
-                        "START  ${seconds((sliderRange.start * clipSize).roundToInt())} s",
-                        "END  ${seconds((sliderRange.endInclusive * clipSize).roundToInt())} s"
-                    ),
-                    selectedIndex = activeMarker,
-                    onSelect = { activeMarker = it }
-                )
+                // START and END switch a marker on (tap again to lock it). CREATE SEGMENT sits between them.
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    ToggleButton(
+                        text = "START\n${seconds((sliderRange.start * clipSize).roundToInt())} s",
+                        on = activeMarker == 0,
+                        enabled = controlsEnabled,
+                        modifier = Modifier.weight(1f).height(56.dp)
+                    ) {
+                        activeMarker = if (activeMarker == 0) -1 else 0
+                    }
+
+                    // Copies the trimmed part of this segment into a new segment (added at the end, not selected)
+                    Button(
+                        onClick = {
+                            if (engine.createSegmentFromLoop()) {
+                                val made = engine.segments.last()
+                                statusText = "Created segment ${made.label} (${seconds(made.length)} s)."
+                                Toast.makeText(context, "Created segment ${made.label}", Toast.LENGTH_SHORT).show()
+                            } else {
+                                val reason = engine.lastCreateError ?: "Couldn't create a segment."
+                                statusText = reason
+                                Toast.makeText(context, reason, Toast.LENGTH_LONG).show()
+                            }
+                        },
+                        enabled = controlsEnabled,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                        ),
+                        contentPadding = PaddingValues(4.dp),
+                        modifier = Modifier.weight(1f).height(56.dp)
+                    ) {
+                        Text(text = "➕ CREATE\nSEGMENT", textAlign = TextAlign.Center, fontSize = 13.sp)
+                    }
+
+                    ToggleButton(
+                        text = "END\n${seconds((sliderRange.endInclusive * clipSize).roundToInt())} s",
+                        on = activeMarker == 1,
+                        enabled = controlsEnabled,
+                        modifier = Modifier.weight(1f).height(56.dp)
+                    ) {
+                        activeMarker = if (activeMarker == 1) -1 else 1
+                    }
+                }
 
                 Spacer(modifier = Modifier.height(24.dp))
             }
@@ -689,11 +759,10 @@ fun LooperDashboard(
                         ) {
                             Text(text = "▼")
                         }
+                        // A gap, so the discard button isn't next to the ▲ ▼ buttons
+                        Spacer(modifier = Modifier.width(20.dp))
                         IconButton(
-                            onClick = {
-                                engine.discardSegment(i)
-                                statusText = "Segment ${seg.label} discarded."
-                            },
+                            onClick = { segmentToDiscard = seg },
                             enabled = controlsEnabled,
                             modifier = Modifier.size(36.dp)
                         ) {
@@ -705,7 +774,7 @@ fun LooperDashboard(
 
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "Tap a segment to open it in the trim tool. Play then loops just that segment, and your trim is applied when you let go of a marker. ◀ ▶ nudge the chosen marker by 0.01 s and ◀◀ ▶▶ by 0.1 s. Tap the segment again to hear the whole loop. Tap or drag on the timeline to jump the red marker. Use ▲ ▼ to reorder (while stopped). CREATE SEGMENT copies whatever is looping into a new segment.",
+                text = "Tap a segment to open it in the trim tool. Play then loops just that segment. Switch on START or END to unlock that marker, then drag it or use ◀ ▶ (0.01 s) and ◀◀ ▶▶ (0.1 s); your trim is applied when you let go. CREATE SEGMENT copies the trimmed part into a new segment. Tap the segment again to hear the whole loop. Tap or drag on the timeline to jump the red marker. Use ▲ ▼ to reorder (while stopped).",
                 style = MaterialTheme.typography.bodySmall
             )
         }
@@ -719,7 +788,20 @@ fun LooperDashboard(
 fun MetronomeSettingsDialog(metronome: Metronome, onDismiss: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Metronome settings") },
+        title = {
+            Column {
+                Text("Metronome settings")
+                Spacer(modifier = Modifier.height(12.dp))
+                // Pinned up here so it is always in reach, even while you scroll through the settings below.
+                // It keeps playing while you change things; DONE stops it.
+                Button(
+                    onClick = { if (metronome.isRunning) metronome.stop() else metronome.start() },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(if (metronome.isRunning) "■ STOP PREVIEW" else "▶ PREVIEW")
+                }
+            }
+        },
         text = {
             Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
                 Text(text = "Tempo", style = MaterialTheme.typography.titleSmall)
@@ -794,15 +876,6 @@ fun MetronomeSettingsDialog(metronome: Metronome, onDismiss: () -> Unit) {
                     onValueChange = { metronome.updateVolume(it) },
                     valueRange = 0.1f..1f
                 )
-
-                Spacer(modifier = Modifier.height(8.dp))
-                // Lets you hear your settings without having to record
-                Button(
-                    onClick = { if (metronome.isRunning) metronome.stop() else metronome.start() },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(if (metronome.isRunning) "■ STOP PREVIEW" else "▶ PREVIEW")
-                }
             }
         },
         confirmButton = {
@@ -877,6 +950,36 @@ private fun OptionRow(options: List<String>, selectedIndex: Int, onSelect: (Int)
                     Text(text = label, maxLines = 1)
                 }
             }
+        }
+    }
+}
+
+/** A two-line button that is filled in while switched on and outlined while off. */
+@Composable
+private fun ToggleButton(
+    text: String,
+    on: Boolean,
+    enabled: Boolean,
+    modifier: Modifier,
+    onClick: () -> Unit
+) {
+    if (on) {
+        Button(
+            onClick = onClick,
+            enabled = enabled,
+            contentPadding = PaddingValues(4.dp),
+            modifier = modifier
+        ) {
+            Text(text = text, textAlign = TextAlign.Center, fontSize = 13.sp)
+        }
+    } else {
+        OutlinedButton(
+            onClick = onClick,
+            enabled = enabled,
+            contentPadding = PaddingValues(4.dp),
+            modifier = modifier
+        ) {
+            Text(text = text, textAlign = TextAlign.Center, fontSize = 13.sp)
         }
     }
 }

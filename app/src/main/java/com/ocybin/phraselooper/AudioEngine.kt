@@ -631,50 +631,63 @@ class AudioEngine {
             var inputDone = false
             var presentationTimeUs = 0L
 
-            while (true) {
-                if (!inputDone) {
-                    val inIndex = enc.dequeueInputBuffer(10000)
-                    if (inIndex >= 0) {
-                        val inBuf = enc.getInputBuffer(inIndex) ?: return false
-                        inBuf.clear()
-                        inBuf.order(ByteOrder.LITTLE_ENDIAN)
+            var done = false
+            while (!done) {
+                // 1) Hand the encoder as much audio as it will take right now
+                while (!inputDone) {
+                    val inIndex = enc.dequeueInputBuffer(0)
+                    if (inIndex < 0) break
 
-                        val count = minOf(inBuf.remaining() / 2, total - sampleIdx, temp.size)
-                        if (count <= 0) {
-                            enc.queueInputBuffer(inIndex, 0, 0, presentationTimeUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                            inputDone = true
-                        } else {
-                            readSamples(segs, sampleIdx, temp, count)
-                            for (i in 0 until count) inBuf.putShort(temp[i])
-                            enc.queueInputBuffer(inIndex, 0, count * 2, presentationTimeUs, 0)
-                            presentationTimeUs += (count * 1_000_000L) / SAMPLE_RATE
-                            sampleIdx += count
-                        }
+                    val inBuf = enc.getInputBuffer(inIndex) ?: return false
+                    inBuf.clear()
+                    inBuf.order(ByteOrder.LITTLE_ENDIAN)
+
+                    val count = minOf(inBuf.remaining() / 2, total - sampleIdx, temp.size)
+                    if (count <= 0) {
+                        enc.queueInputBuffer(inIndex, 0, 0, presentationTimeUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        inputDone = true
+                    } else {
+                        readSamples(segs, sampleIdx, temp, count)
+                        inBuf.asShortBuffer().put(temp, 0, count)
+                        enc.queueInputBuffer(inIndex, 0, count * 2, presentationTimeUs, 0)
+                        presentationTimeUs += (count * 1_000_000L) / SAMPLE_RATE
+                        sampleIdx += count
                     }
                 }
 
-                val outIndex = enc.dequeueOutputBuffer(info, 10000)
-                if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    if (!muxerStarted) {
-                        trackIndex = muxer.addTrack(enc.outputFormat)
-                        muxer.start()
-                        muxerStarted = true
-                    }
-                } else if (outIndex >= 0) {
-                    val outBuf = enc.getOutputBuffer(outIndex)
+                // 2) Collect everything the encoder has finished. Only the first check waits
+                // (briefly); the rest take whatever is already ready, so the encoder never stalls.
+                var waitUs = 10_000L
+                while (true) {
+                    val outIndex = enc.dequeueOutputBuffer(info, waitUs)
+                    waitUs = 0L
+                    if (outIndex == MediaCodec.INFO_TRY_AGAIN_LATER) break
 
-                    if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-                        info.size = 0
-                    }
-                    if (info.size > 0 && muxerStarted && outBuf != null) {
-                        outBuf.position(info.offset)
-                        outBuf.limit(info.offset + info.size)
-                        muxer.writeSampleData(trackIndex, outBuf, info)
-                    }
+                    if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        if (!muxerStarted) {
+                            trackIndex = muxer.addTrack(enc.outputFormat)
+                            muxer.start()
+                            muxerStarted = true
+                        }
+                    } else if (outIndex >= 0) {
+                        val outBuf = enc.getOutputBuffer(outIndex)
 
-                    enc.releaseOutputBuffer(outIndex, false)
+                        if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                            info.size = 0
+                        }
+                        if (info.size > 0 && muxerStarted && outBuf != null) {
+                            outBuf.position(info.offset)
+                            outBuf.limit(info.offset + info.size)
+                            muxer.writeSampleData(trackIndex, outBuf, info)
+                        }
 
-                    if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
+                        enc.releaseOutputBuffer(outIndex, false)
+
+                        if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                            done = true
+                            break
+                        }
+                    }
                 }
             }
             return true
